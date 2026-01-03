@@ -28,6 +28,10 @@ class PDFLayoutConfig:
     header_filename: str = "header.png"
     footer_filename: str = "footer.png"
 
+    signature_filename: str = "firma.png"
+    signature_width_ratio: float = 0.60   # ajusta (0.55–0.70 suele quedar bien)
+    signature_gap_before: float = 10.0     # espacio (mm) después de la tabla
+
     # Salida
     output_dirname: str = "BD/PRECOSTEOS"
     output_prefix: str = "PRECOSTEO"
@@ -67,6 +71,10 @@ class CreatePrecostoPDF(FPDF):
 
         self.header_img = self._templates_dir / self.config.header_filename
         self.footer_img = self._templates_dir / self.config.footer_filename
+
+        self.signature_img = self._templates_dir / self.config.signature_filename
+        if not self.signature_img.exists():
+            raise FileNotFoundError(f"No se encontró firma: {self.signature_img}")
 
         if not self.header_img.exists():
             raise FileNotFoundError(f"No se encontró header: {self.header_img}")
@@ -495,6 +503,38 @@ class CreatePrecostoPDF(FPDF):
         # Reset colores
         self.set_text_color(0, 0, 0)
 
+        self._write_precosteo_status_and_signature(estado="EN APROBACIÓN")
+
+
+    def _write_precosteo_status_and_signature(self, estado: str = "EN APROBACIÓN") -> None:
+        """
+        Dibuja:
+        - ESTADO PRECOSTEO: ● EN APROBACIÓN
+        - Cordialmente,
+        - firma.png centrada (como tu ejemplo)
+        """
+        # Espacio después de la tabla
+        self.ln(self.config.signature_gap_before)
+
+      
+        # 3) Firma (imagen)
+        page_width = self.w
+        usable_w = page_width - self.l_margin - self.r_margin
+        sig_w = usable_w * self.config.signature_width_ratio
+        x_img = self.l_margin  # alineada al margen izquierdo, como tu ejemplo
+        # si la quieres centrada: x_img = self.l_margin + (usable_w - sig_w) / 2
+
+        # Si no cabe, saltar de página antes de ponerla (para no chocar con footer)
+        # Estimación de alto: en fpdf no sabemos el alto exacto sin leer imagen,
+        # así que dejamos un margen razonable.
+        needed_space = 55  # mm aprox para firma + texto (ajusta si tu firma es más alta)
+        if self.get_y() + needed_space > (self.h - self.b_margin):
+            self.add_page()
+
+        self.image(str(self.signature_img), x=x_img, y=self.get_y(), w=sig_w)
+        self.ln(45)  # avance vertical después de la imagen (ajusta según tu firma.png)
+
+
     # ─────────────── Render principal ───────────────
     def render_precosteo(
         self,
@@ -552,7 +592,7 @@ class CreatePrecostoPDF(FPDF):
 
         # Tabla actividades (filtrada por fechas)
         bd_filtrado = self.filter_bd_by_range(bd, fecha_inicio, fecha_fin)
-        
+
         # Excluir actividades por ID_ITEM (ej: 1.21 = "Llenado de tanques")
         if bd_filtrado is not None and "ID_ITEM" in bd_filtrado.columns:
             bd_filtrado = bd_filtrado[bd_filtrado["ID_ITEM"].astype(str).str.strip() != "1.21"]
