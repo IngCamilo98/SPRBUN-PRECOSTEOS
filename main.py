@@ -1,3 +1,5 @@
+
+
 def main():
     # 1) Configuración / rutas base
     # 2) Leer datos (Excel / BD)
