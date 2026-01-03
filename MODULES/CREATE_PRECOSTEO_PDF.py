@@ -16,14 +16,12 @@ class PDFLayoutConfig:
     format: str = "Letter"  # tamaño carta
 
     # Márgenes (mm)
-    top_margin: float = 35.0
+    top_margin: float = 22.0
     left_margin: float = 15.0
     right_margin: float = 15.0
-    footer_margin: float = 25.0
 
     # Espacios visuales (mm)
-    header_lift_after: float = 30.0
-    footer_height: float = 20.0 
+    header_lift_after: float = 12.0
 
     # Plantillas
     templates_dirname: str = "TEMPLATES"
@@ -40,12 +38,10 @@ class PDFLayoutConfig:
     default_line_height: float = 6.0
 
     # Footer (ajuste fino visual)
-    footer_height: float = 12.0          # más pequeño
-    footer_width_ratio: float = 0.50     # 50% del ancho de la página
-    footer_bottom_margin: float = 7.0   # separación del borde inferior (mm)
-    footer_margin: float = 28.0          # margen de seguridad para el contenido
-
-
+    footer_height: float = 12.0
+    footer_width_ratio: float = 0.50
+    footer_bottom_margin: float = 7.0
+    footer_margin: float = 28.0  # margen de seguridad para el contenido
 
 
 class CreatePrecostoPDF(FPDF):
@@ -53,7 +49,7 @@ class CreatePrecostoPDF(FPDF):
     PDF base para precosteos AMC / SPRBUN:
     - Tamaño carta
     - Header y Footer automáticos (TEMPLATES/)
-    - Configuración encapsulada (main limpio)
+    - Render del contenido tipo carta (como tu imagen)
     """
 
     def __init__(self, config: PDFLayoutConfig | None = None):
@@ -85,6 +81,9 @@ class CreatePrecostoPDF(FPDF):
         )
         self.set_auto_page_break(auto=True, margin=self.config.footer_margin)
 
+        # Para recibir bd (sin usarlo aún)
+        self._bd = None
+
     @staticmethod
     def _resolve_project_root() -> Path:
         return Path(__file__).resolve().parents[1]
@@ -99,40 +98,130 @@ class CreatePrecostoPDF(FPDF):
         page_width = self.w
         page_height = self.h
 
-        # Ancho del footer (centrado)
         footer_width = page_width * self.config.footer_width_ratio
         x = (page_width - footer_width) / 2
-
-        # Posición vertical: separado del borde inferior
         y = page_height - self.config.footer_bottom_margin - self.config.footer_height
 
-        self.image(
-            str(self.footer_img),
-            x=x,
-            y=y,
-            w=footer_width
-        )
+        self.image(str(self.footer_img), x=x, y=y, w=footer_width)
 
     # ─────────────── Helpers internos ───────────────
     def new_page(self) -> None:
         self.add_page()
 
-    def set_default_typography(self) -> None:
-        """Define tipografía por defecto (sin que main toque fonts)."""
-        self.set_font(self.config.default_font_family, size=self.config.default_font_size)
+    def set_default_typography(self, size: int | None = None, bold: bool = False) -> None:
+        fam = self.config.default_font_family
+        style = "B" if bold else ""
+        self.set_font(fam, style=style, size=size or self.config.default_font_size)
 
-    def write_paragraph(self, text: str) -> None:
-        """Escritura estándar de párrafos."""
-        self.set_default_typography()
-        self.multi_cell(0, self.config.default_line_height, text)
+    @staticmethod
+    def _fecha_es(dt: datetime) -> str:
+        meses = {
+            1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
+            5: "mayo", 6: "junio", 7: "julio", 8: "agosto",
+            9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
+        }
+        return f"{dt.day} de {meses[dt.month]} de {dt.year}"
 
-    def render_demo(self) -> None:
+    @staticmethod
+    def _infer_lugares_text(df_lugares) -> str:
         """
-        Demo interna: crea 1-2 páginas con texto de prueba.
-        Útil para validar header/footer y márgenes.
+        Intenta armar el texto de 'Lugar de ejecución' desde un dataframe.
+        - Prioriza columnas típicas
+        - Si no encuentra, usa la primera columna
         """
+        try:
+            cols = [c.strip() for c in df_lugares.columns]
+        except Exception:
+            return ""
+
+        preferidas = [
+            "LUGAR_EJECUCION", "LUGAR", "LUGAR DE EJECUCIÓN", "LUGAR DE EJECUCION",
+            "UBICACION", "UBICACIÓN", "DESCRIPCION_LUGAR", "DESCRIPCIÓN"
+        ]
+
+        col = None
+        upper_map = {c.upper(): c for c in cols}
+        for p in preferidas:
+            if p.upper() in upper_map:
+                col = upper_map[p.upper()]
+                break
+
+        if col is None:
+            col = cols[0] if cols else None
+
+        if not col:
+            return ""
+
+        # únicos, limpios, en orden de aparición
+        seen = set()
+        items = []
+        for v in df_lugares[col].tolist():
+            s = str(v).strip()
+            if not s or s.lower() == "nan":
+                continue
+            key = s.lower()
+            if key not in seen:
+                seen.add(key)
+                items.append(s)
+
+        return ", ".join(items)
+
+    def _write_spaced(self, mm: float) -> None:
+        self.ln(mm)
+
+    def render_precosteo(
+        self,
+        codigo_precosteo: str,
+        resumen: str,
+        df_lugares,
+        bd=None,
+    ) -> None:
+        """
+        Construye el contenido del PDF como tu imagen:
+        - Código arriba a la derecha (debajo del header)
+        - 'Santiago de Cali, <fecha dinámica>'
+        - Bloque de destinatario fijo
+        - Párrafo resumen
+        - 'Lugar de ejecución:' desde df_lugares
+        - Recibe 'bd' (se guarda para usar luego)
+        """
+        self._bd = bd
+
         self.new_page()
-        self.write_paragraph("Prueba: PDF con header/footer automáticos desde TEMPLATES.")
+
+        # 1) Código (alineado a la derecha)
+        self.set_default_typography(size=12, bold=True)
+        self.cell(0, 6, codigo_precosteo, ln=1, align="R")
+
+        # 2) Ciudad + fecha dinámica (ciudad fija)
+        self._write_spaced(2)
+        self.set_default_typography(size=12, bold=True)
+        fecha = self._fecha_es(datetime.now())
+        self.cell(0, 6, f"Santiago de Cali, {fecha}", ln=1, align="L")
+
+        # 3) Señores + razón social fija
+        self._write_spaced(12)
+        self.set_default_typography(size=12, bold=True)
+        self.cell(0, 6, "Señores:", ln=1, align="L")
+
+        self._write_spaced(10)
+        self.set_default_typography(size=12, bold=True)
+        self.multi_cell(0, 6, "SOCIEDAD PORTUARIA REGIONAL DE BUENAVENTURA", align="L")
+
+        # 4) Resumen (párrafo)
+        self._write_spaced(6)
+        self.set_default_typography(size=11, bold=False)
+        self.multi_cell(0, 6, resumen.strip(), align="J")
+
+        # 5) Lugar de ejecución desde df_lugares
+        lugares_txt = self._infer_lugares_text(df_lugares)
+        if lugares_txt:
+            self._write_spaced(8)
+            self.set_default_typography(size=11, bold=True)
+            # etiqueta en negrilla + texto normal (simulando la foto)
+            self.cell(self.get_string_width("Lugar de ejecución:") + 1, 6, "Lugar de ejecución:", ln=0)
+            self.set_default_typography(size=11, bold=False)
+            self.multi_cell(0, 6, f" {lugares_txt}", align="L")
 
     def default_output_path(self, cod_prec: str | None = None) -> Path:
         self._output_dir.mkdir(parents=True, exist_ok=True)
