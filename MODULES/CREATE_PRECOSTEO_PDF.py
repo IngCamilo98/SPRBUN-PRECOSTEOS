@@ -552,6 +552,10 @@ class CreatePrecostoPDF(FPDF):
 
         # Tabla actividades (filtrada por fechas)
         bd_filtrado = self.filter_bd_by_range(bd, fecha_inicio, fecha_fin)
+        
+        # Excluir actividades por ID_ITEM (ej: 1.21 = "Llenado de tanques")
+        if bd_filtrado is not None and "ID_ITEM" in bd_filtrado.columns:
+            bd_filtrado = bd_filtrado[bd_filtrado["ID_ITEM"].astype(str).str.strip() != "1.21"]
 
         # Para el título amarillo usamos un "título corto" del lugar:
         lugar_titulo = ""
