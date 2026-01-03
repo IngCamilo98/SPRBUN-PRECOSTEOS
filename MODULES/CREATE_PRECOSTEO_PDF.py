@@ -1,9 +1,9 @@
-# MODULES/CREATE_PRECOSTEO_PDF.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
+from typing import Optional, Tuple
 
 from fpdf import FPDF
 
@@ -13,10 +13,10 @@ class PDFLayoutConfig:
     # Página
     orientation: str = "P"
     unit: str = "mm"
-    format: str = "Letter"  # tamaño carta
+    format: str = "Letter"
 
     # Márgenes (mm)
-    top_margin: float = 22.0
+    top_margin: float = 24.0
     left_margin: float = 15.0
     right_margin: float = 15.0
 
@@ -49,7 +49,7 @@ class CreatePrecostoPDF(FPDF):
     PDF base para precosteos AMC / SPRBUN:
     - Tamaño carta
     - Header y Footer automáticos (TEMPLATES/)
-    - Render del contenido tipo carta (como tu imagen)
+    - Contenido tipo carta + tabla de actividades desde dataframe BD
     """
 
     def __init__(self, config: PDFLayoutConfig | None = None):
@@ -81,8 +81,7 @@ class CreatePrecostoPDF(FPDF):
         )
         self.set_auto_page_break(auto=True, margin=self.config.footer_margin)
 
-        # Para recibir bd (sin usarlo aún)
-        self._bd = None
+        self._bd = None  # se guarda por si luego lo usas en otras secciones
 
     @staticmethod
     def _resolve_project_root() -> Path:
@@ -104,7 +103,7 @@ class CreatePrecostoPDF(FPDF):
 
         self.image(str(self.footer_img), x=x, y=y, w=footer_width)
 
-    # ─────────────── Helpers internos ───────────────
+    # ─────────────── Tipografía / helpers ───────────────
     def new_page(self) -> None:
         self.add_page()
 
@@ -123,36 +122,78 @@ class CreatePrecostoPDF(FPDF):
         return f"{dt.day} de {meses[dt.month]} de {dt.year}"
 
     @staticmethod
-    def _infer_lugares_text(df_lugares) -> str:
-        """
-        Intenta armar el texto de 'Lugar de ejecución' desde un dataframe.
-        - Prioriza columnas típicas
-        - Si no encuentra, usa la primera columna
-        """
+    def _money_cop(value) -> str:
+        """Formatea en estilo COP: 60.000,00"""
         try:
-            cols = [c.strip() for c in df_lugares.columns]
+            v = float(value)
+        except Exception:
+            return str(value)
+        # miles con punto y decimales con coma
+        s = f"{v:,.2f}"            # 60,000.00
+        s = s.replace(",", "X").replace(".", ",").replace("X", ".")  # 60.000,00
+        return s
+    
+    def _nb_lines(self, w: float, txt: str, line_h: float) -> int:
+        """
+        Calcula cuántas líneas usará multi_cell() para un texto dado
+        con el ancho 'w' y altura de línea 'line_h', usando el ancho real
+        de la fuente actual (get_string_width).
+        """
+        if txt is None:
+            return 1
+        s = str(txt).replace("\r", "")
+        if not s:
+            return 1
+
+        # Maneja saltos de línea explícitos
+        parts = s.split("\n")
+        total = 0
+        for part in parts:
+            if part == "":
+                total += 1
+                continue
+
+            words = part.split(" ")
+            line = ""
+            lines = 1
+            for wd in words:
+                test = (line + " " + wd).strip()
+                if self.get_string_width(test) <= (w - 2):  # 2mm de margen de seguridad
+                    line = test
+                else:
+                    lines += 1
+                    line = wd
+            total += lines
+        return max(1, total)
+
+    @staticmethod
+    def _safe_upper(s: str) -> str:
+        return (s or "").strip().upper()
+
+    # ─────────────── Lugares ───────────────
+    @staticmethod
+    def _infer_lugares_text(df_lugares) -> str:
+        try:
+            cols = list(df_lugares.columns)
         except Exception:
             return ""
 
         preferidas = [
             "LUGAR_EJECUCION", "LUGAR", "LUGAR DE EJECUCIÓN", "LUGAR DE EJECUCION",
-            "UBICACION", "UBICACIÓN", "DESCRIPCION_LUGAR", "DESCRIPCIÓN"
+            "UBICACION", "UBICACIÓN", "DESCRIPCION_LUGAR", "DESCRIPCIÓN", "DESCRIPCION"
         ]
 
         col = None
-        upper_map = {c.upper(): c for c in cols}
+        upper_map = {str(c).strip().upper(): c for c in cols}
         for p in preferidas:
             if p.upper() in upper_map:
                 col = upper_map[p.upper()]
                 break
-
+        if col is None and cols:
+            col = cols[0]
         if col is None:
-            col = cols[0] if cols else None
-
-        if not col:
             return ""
 
-        # únicos, limpios, en orden de aparición
         seen = set()
         items = []
         for v in df_lugares[col].tolist():
@@ -163,66 +204,363 @@ class CreatePrecostoPDF(FPDF):
             if key not in seen:
                 seen.add(key)
                 items.append(s)
-
         return ", ".join(items)
 
-    def _write_spaced(self, mm: float) -> None:
-        self.ln(mm)
+    # ─────────────── Fechas / filtro BD ───────────────
+    @staticmethod
+    def _to_date(x) -> Optional[date]:
+        """Convierte a date; acepta datetime/date/strings comunes (dd/mm/yyyy, yyyy-mm-dd, etc.)."""
+        if x is None:
+            return None
+        if isinstance(x, datetime):
+            return x.date()
+        if isinstance(x, date):
+            return x
+        s = str(x).strip()
+        if not s or s.lower() == "nan":
+            return None
 
+        # intentos típicos
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except Exception:
+                pass
+
+        # último intento: solo números separados
+        try:
+            parts = [p for p in s.replace(".", "/").replace("-", "/").split("/") if p]
+            if len(parts) == 3:
+                a, b, c = parts
+                # heurística dayfirst
+                if len(c) == 4:
+                    # a/b/c
+                    da = int(a); db = int(b); dc = int(c)
+                    # si a > 12 => dayfirst
+                    if da > 12:
+                        return date(dc, db, da)
+                    # si b > 12 => monthfirst
+                    if db > 12:
+                        return date(dc, da, db)
+                    # por defecto dayfirst
+                    return date(dc, db, da)
+        except Exception:
+            return None
+
+        return None
+
+    @staticmethod
+    def _detect_date_columns(df) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Devuelve (col_fecha_unica, col_inicio, col_fin)
+        - Si existe una sola columna fecha -> col_fecha_unica
+        - Si existe par inicio/fin -> col_inicio y col_fin
+        """
+        cols = [str(c).strip() for c in df.columns]
+        U = {c.upper(): c for c in cols}
+
+        # candidatos
+        fecha_unica = None
+        inicio = None
+        fin = None
+
+        # una sola fecha
+        for key in ["FECHA", "FECHA_ACTIVIDAD", "FECHA_EJECUCION", "FECHA EJECUCION", "DATE"]:
+            if key in U:
+                fecha_unica = U[key]
+                break
+
+        # rango
+        for key in ["FECHA_INICIO", "INICIO", "FECHA INICIO", "START", "DESDE"]:
+            if key in U:
+                inicio = U[key]
+                break
+
+        for key in ["FECHA_FIN", "FIN", "FECHA FIN", "END", "HASTA"]:
+            if key in U:
+                fin = U[key]
+                break
+
+        # Si hay rango, priorizar rango
+        if inicio and fin:
+            return (None, inicio, fin)
+
+        return (fecha_unica, None, None)
+
+    def filter_bd_by_range(self, bd_df, fecha_inicio, fecha_fin):
+        """
+        Filtra el dataframe BD por fechas:
+        - Si existe columna FECHA: inicio <= FECHA <= fin
+        - Si existe INICIO/FIN en BD: intersección de rangos con [inicio, fin]
+        - Si no hay columnas fecha detectables: retorna BD completo
+        """
+        if bd_df is None:
+            return None
+
+        ini = self._to_date(fecha_inicio)
+        fin = self._to_date(fecha_fin)
+        if ini is None or fin is None:
+            return bd_df
+
+        col_fecha, col_ini, col_fin = self._detect_date_columns(bd_df)
+
+        # Copia liviana
+        df = bd_df.copy()
+
+        if col_fecha:
+            df["_FECHA_"] = df[col_fecha].apply(self._to_date)
+            df = df[df["_FECHA_"].notna()]
+            df = df[(df["_FECHA_"] >= ini) & (df["_FECHA_"] <= fin)]
+            df = df.drop(columns=["_FECHA_"], errors="ignore")
+            return df
+
+        if col_ini and col_fin:
+            df["_INI_"] = df[col_ini].apply(self._to_date)
+            df["_FIN_"] = df[col_fin].apply(self._to_date)
+            df = df[df["_INI_"].notna() & df["_FIN_"].notna()]
+            # intersección: (ini <= FIN_BD) y (fin >= INI_BD)
+            df = df[(ini <= df["_FIN_"]) & (fin >= df["_INI_"])]
+            df = df.drop(columns=["_INI_", "_FIN_"], errors="ignore")
+            return df
+
+        return df
+
+    # ─────────────── Tabla ───────────────
+    @staticmethod
+    def _detect_table_columns(df) -> dict:
+        cols = [str(c).strip() for c in df.columns]
+        U = {c.upper(): c for c in cols}
+
+        def pick(*candidates):
+            for k in candidates:
+                kk = k.upper()
+                if kk in U:
+                    return U[kk]
+            return None
+
+        return {
+            "item": pick("ID_ITEM", "ID ÍTEM", "ID_ITEM ", "ITEM", "ÍTEM", "COD_ITEM"),
+            "descripcion": pick("ACTIVIDAD", "DESCRIPCION", "DESCRIPCIÓN", "DESCRIPCION_ACTIVIDAD"),
+            "unidad": pick("UNIDAD_MEDIDA", "UNIDAD", "UND"),
+            "cantidad": pick("CANTIDAD", "CANT"),
+            "v_unit": pick("VALOR_UNITARIO", "VR_UNITARIO", "VLR_UNITARIO", "PRECIO_UNITARIO"),
+            "v_total": pick("VALOR_TOTAL", "VR_TOTAL", "VLR_TOTAL", "TOTAL"),
+        }
+
+    def _write_section_table(
+        self,
+        lugar_titulo: str,
+        codigo_precosteo: str,
+        bd_filtrado,
+    ) -> None:
+        """
+        Dibuja la sección de tabla como la imagen.
+        """
+        if bd_filtrado is None or len(bd_filtrado) == 0:
+            return
+
+        # Título
+        self.ln(8)
+        self.set_default_typography(size=12, bold=True)
+        self.cell(0, 7, "ACTIVIDADES APLICABLES SEGÚN CONTRATO", ln=1, align="L")
+
+        # Dimensiones
+        usable_w = self.w - self.l_margin - self.r_margin
+
+
+        self.set_draw_color(0, 0, 0)   # color del borde negro
+        self.set_line_width(0.4)       # grosor del borde
+
+        # Franja amarilla (lugar)
+        self.set_fill_color(255, 192, 0)  # amarillo
+        self.set_text_color(0, 0, 0)
+        self.set_default_typography(size=11, bold=True)
+        self.cell(usable_w, 8, self._safe_upper(lugar_titulo), ln=1, align="C", fill=True, border=1)
+
+
+        # Franja azul (código)
+        self.set_fill_color(0, 176, 240)  # azul
+        self.set_default_typography(size=11, bold=True)
+        self.cell(usable_w, 8, codigo_precosteo, ln=1, align="C", fill=True, border=1)
+
+        # Header tabla
+        self.set_fill_color(189, 215, 238)  # azul claro
+        self.set_default_typography(size=10, bold=True)
+
+        # Columnas
+        w_item = 12
+        w_desc = 78
+        w_und = 16
+        w_cant = 20
+        w_vu = 34
+        w_vt = usable_w - (w_item + w_desc + w_und + w_cant + w_vu)
+
+        headers = [
+            ("Ítem", w_item),
+            ("Descripción", w_desc),
+            ("Unidad", w_und),
+            ("Cantidad", w_cant),
+            ("Valor Unitario", w_vu),
+            ("Valor Total", w_vt),
+        ]
+
+        self.set_draw_color(0, 0, 0)
+        self.set_line_width(0.4)
+
+        for text, ww in headers:
+            self.cell(ww, 8, text, border=1, align="C", fill=True)
+        self.ln(8)
+
+        # Detectar columnas del df
+        colmap = self._detect_table_columns(bd_filtrado)
+
+        # Render filas
+        self.set_default_typography(size=10, bold=False)
+        total_general = 0.0
+
+        # Parámetros consistentes para cálculo y escritura
+        line_h = 5.5
+        pad = 1
+
+        for _, row in bd_filtrado.iterrows():
+            item = str(row[colmap["item"]]).strip() if colmap["item"] else ""
+            desc = str(row[colmap["descripcion"]]).strip() if colmap["descripcion"] else ""
+            und  = str(row[colmap["unidad"]]).strip() if colmap["unidad"] else ""
+            cant = row[colmap["cantidad"]] if colmap["cantidad"] else ""
+            vunit = row[colmap["v_unit"]] if colmap["v_unit"] else ""
+            vtotal = row[colmap["v_total"]] if colmap["v_total"] else ""
+
+            # Total general (robusto si vtotal viene como string con $)
+            try:
+                # Si tienes _parse_number(), úsalo:
+                if hasattr(self, "_parse_number"):
+                    total_general += float(self._parse_number(vtotal))
+                else:
+                    total_general += float(vtotal)
+            except Exception:
+                pass
+
+            # --------- calcular altura REAL de la fila según descripción ----------
+            # Importante: la fuente debe estar seteada antes de medir
+            self.set_default_typography(size=10, bold=False)
+
+            lines = self._nb_lines(w_desc - 2 * pad, desc, line_h)
+            row_h = (line_h * lines) + (2 * pad)
+
+            x = self.l_margin
+            y = self.get_y()
+
+            # 1) Ítem (CELL)
+            self.set_xy(x, y)
+            self.cell(w_item, row_h, item, border=1, align="C")
+
+            # 2) Descripción (RECT + MULTI_CELL con padding)
+            self.set_xy(x + w_item, y)
+            self.rect(x + w_item, y, w_desc, row_h)  # borde exacto
+            self.set_xy(x + w_item + pad, y + pad)
+            self.multi_cell(w_desc - 2 * pad, line_h, desc, border=0, align="L")
+
+            # 3) Unidad (CELL)
+            self.set_xy(x + w_item + w_desc, y)
+            self.cell(w_und, row_h, und, border=1, align="C")
+
+            # 4) Cantidad (CELL)
+            self.set_xy(x + w_item + w_desc + w_und, y)
+            self.cell(w_cant, row_h, str(cant), border=1, align="C")
+
+            # 5) Valor Unitario (CELL)
+            self.set_xy(x + w_item + w_desc + w_und + w_cant, y)
+            self.cell(w_vu, row_h, f"$  {self._money_cop(vunit)}", border=1, align="R")
+
+            # 6) Valor Total (CELL)
+            self.set_xy(x + w_item + w_desc + w_und + w_cant + w_vu, y)
+            self.cell(w_vt, row_h, f"$  {self._money_cop(vtotal)}", border=1, align="R")
+
+            # bajar al final de la fila
+            self.set_y(y + row_h)
+
+            # salto de página preventivo
+            if self.get_y() > (self.h - self.b_margin - 15):
+                self.add_page()
+
+        # Fila Total (verde)
+        self.set_fill_color(146, 208, 80)
+        self.set_default_typography(size=10, bold=True)
+
+        self.cell(w_item + w_desc + w_und + w_cant, 8, "", border=1, fill=False)
+        self.cell(w_vu, 8, "Total", border=1, align="C", fill=True)
+        self.cell(w_vt, 8, f"$  {self._money_cop(total_general)}", border=1, align="R", fill=True)
+        self.ln(8)
+
+        # Reset colores
+        self.set_text_color(0, 0, 0)
+
+    # ─────────────── Render principal ───────────────
     def render_precosteo(
         self,
         codigo_precosteo: str,
         resumen: str,
         df_lugares,
-        bd=None,
+        fecha_inicio,
+        fecha_fin,
+        bd,
     ) -> None:
         """
-        Construye el contenido del PDF como tu imagen:
-        - Código arriba a la derecha (debajo del header)
-        - 'Santiago de Cali, <fecha dinámica>'
-        - Bloque de destinatario fijo
-        - Párrafo resumen
-        - 'Lugar de ejecución:' desde df_lugares
-        - Recibe 'bd' (se guarda para usar luego)
+        Construye el PDF:
+        - Código arriba a la derecha
+        - Fecha dinámica (Santiago de Cali, ...)
+        - Señores + razón social fija
+        - Resumen
+        - Lugar de ejecución (desde df_lugares)
+        - Tabla de actividades filtradas por [fecha_inicio, fecha_fin] desde bd
         """
         self._bd = bd
 
         self.new_page()
 
-        # 1) Código (alineado a la derecha)
+        # Código (derecha)
         self.set_default_typography(size=12, bold=True)
         self.cell(0, 6, codigo_precosteo, ln=1, align="R")
 
-        # 2) Ciudad + fecha dinámica (ciudad fija)
-        self._write_spaced(2)
+        # Ciudad + fecha
+        self.ln(2)
         self.set_default_typography(size=12, bold=True)
-        fecha = self._fecha_es(datetime.now())
-        self.cell(0, 6, f"Santiago de Cali, {fecha}", ln=1, align="L")
+        self.cell(0, 6, f"Santiago de Cali, {self._fecha_es(datetime.now())}", ln=1, align="L")
 
-        # 3) Señores + razón social fija
-        self._write_spaced(12)
+        # Señores
+        self.ln(6)
         self.set_default_typography(size=12, bold=True)
         self.cell(0, 6, "Señores:", ln=1, align="L")
 
-        self._write_spaced(10)
+        self.ln(4)
         self.set_default_typography(size=12, bold=True)
         self.multi_cell(0, 6, "SOCIEDAD PORTUARIA REGIONAL DE BUENAVENTURA", align="L")
 
-        # 4) Resumen (párrafo)
-        self._write_spaced(6)
+        # Resumen
+        self.ln(3)
         self.set_default_typography(size=11, bold=False)
         self.multi_cell(0, 6, resumen.strip(), align="J")
 
-        # 5) Lugar de ejecución desde df_lugares
+        # Lugar ejecución
         lugares_txt = self._infer_lugares_text(df_lugares)
         if lugares_txt:
-            self._write_spaced(8)
+            self.ln(4)
             self.set_default_typography(size=11, bold=True)
-            # etiqueta en negrilla + texto normal (simulando la foto)
             self.cell(self.get_string_width("Lugar de ejecución:") + 1, 6, "Lugar de ejecución:", ln=0)
             self.set_default_typography(size=11, bold=False)
             self.multi_cell(0, 6, f" {lugares_txt}", align="L")
 
+        # Tabla actividades (filtrada por fechas)
+        bd_filtrado = self.filter_bd_by_range(bd, fecha_inicio, fecha_fin)
+
+        # Para el título amarillo usamos un "título corto" del lugar:
+        lugar_titulo = ""
+        if lugares_txt:
+            # si viene largo, usa la primera parte como título
+            lugar_titulo = lugares_txt.split(",")[0].strip()[:60]
+        self._write_section_table(lugar_titulo=lugar_titulo or "LUGAR DE EJECUCIÓN", codigo_precosteo=codigo_precosteo, bd_filtrado=bd_filtrado)
+
+    # ─────────────── Guardado ───────────────
     def default_output_path(self, cod_prec: str | None = None) -> Path:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         date_str = datetime.now().strftime("%Y-%m-%d")
