@@ -363,6 +363,9 @@ class CreatePrecostoPDF(FPDF):
     ) -> None:
         """
         Dibuja la sección de tabla como la imagen.
+        - Repite encabezado (franjas + header columnas) en cada página.
+        - Salto de página manual por fila (evita páginas cortadas).
+        - Total corregido (no se desborda).
         """
         if bd_filtrado is None or len(bd_filtrado) == 0:
             return
@@ -375,27 +378,7 @@ class CreatePrecostoPDF(FPDF):
         # Dimensiones
         usable_w = self.w - self.l_margin - self.r_margin
 
-
-        self.set_draw_color(0, 0, 0)   # color del borde negro
-        self.set_line_width(0.4)       # grosor del borde
-
-        # Franja amarilla (lugar)
-        self.set_fill_color(255, 192, 0)  # amarillo
-        self.set_text_color(0, 0, 0)
-        self.set_default_typography(size=11, bold=True)
-        self.cell(usable_w, 8, self._safe_upper(lugar_titulo), ln=1, align="C", fill=True, border=1)
-
-
-        # Franja azul (código)
-        self.set_fill_color(0, 176, 240)  # azul
-        self.set_default_typography(size=11, bold=True)
-        self.cell(usable_w, 8, codigo_precosteo, ln=1, align="C", fill=True, border=1)
-
-        # Header tabla
-        self.set_fill_color(189, 215, 238)  # azul claro
-        self.set_default_typography(size=10, bold=True)
-
-        # Columnas
+        # Columnas (ajústalas si quieres)
         w_item = 12
         w_desc = 78
         w_und = 16
@@ -412,98 +395,143 @@ class CreatePrecostoPDF(FPDF):
             ("Valor Total", w_vt),
         ]
 
-        self.set_draw_color(0, 0, 0)
-        self.set_line_width(0.4)
+        # Encabezado repetible (franjas + header columnas)
+        def _draw_table_header():
+            # Bordes visibles
+            self.set_draw_color(0, 0, 0)
+            self.set_line_width(0.4)
+            self.set_text_color(0, 0, 0)
 
-        for text, ww in headers:
-            self.cell(ww, 8, text, border=1, align="C", fill=True)
-        self.ln(8)
+            # Franja amarilla (lugar)
+            self.set_fill_color(255, 192, 0)
+            self.set_default_typography(size=11, bold=True)
+            self.cell(usable_w, 8, self._safe_upper(lugar_titulo), ln=1, align="C", fill=True, border=1)
+
+            # Franja azul (código)
+            self.set_fill_color(0, 176, 240)
+            self.set_default_typography(size=11, bold=True)
+            self.cell(usable_w, 8, codigo_precosteo, ln=1, align="C", fill=True, border=1)
+
+            # Header tabla
+            self.set_fill_color(189, 215, 238)
+            self.set_default_typography(size=10, bold=True)
+            for text, ww in headers:
+                self.cell(ww, 8, text, border=1, align="C", fill=True)
+            self.ln(8)
+
+            # Fuente para filas
+            self.set_default_typography(size=10, bold=False)
+
+        # Dibujar encabezado inicial
+        _draw_table_header()
 
         # Detectar columnas del df
         colmap = self._detect_table_columns(bd_filtrado)
 
         # Render filas
-        self.set_default_typography(size=10, bold=False)
         total_general = 0.0
 
-        # Parámetros consistentes para cálculo y escritura
+        # Parámetros consistentes
         line_h = 5.5
         pad = 1
 
-        for _, row in bd_filtrado.iterrows():
-            item = str(row[colmap["item"]]).strip() if colmap["item"] else ""
-            desc = str(row[colmap["descripcion"]]).strip() if colmap["descripcion"] else ""
-            und  = str(row[colmap["unidad"]]).strip() if colmap["unidad"] else ""
-            cant = row[colmap["cantidad"]] if colmap["cantidad"] else ""
-            vunit = row[colmap["v_unit"]] if colmap["v_unit"] else ""
-            vtotal = row[colmap["v_total"]] if colmap["v_total"] else ""
+        # Desactivar auto page break durante la tabla (lo manejamos manual)
+        old_apb = self.auto_page_break
+        old_bm = self.b_margin
+        self.set_auto_page_break(auto=False, margin=self.b_margin)
 
-            # Total general (robusto si vtotal viene como string con $)
-            try:
-                # Si tienes _parse_number(), úsalo:
-                if hasattr(self, "_parse_number"):
-                    total_general += float(self._parse_number(vtotal))
-                else:
-                    total_general += float(vtotal)
-            except Exception:
-                pass
+        try:
+            for _, row in bd_filtrado.iterrows():
+                item = str(row[colmap["item"]]).strip() if colmap["item"] else ""
+                desc = str(row[colmap["descripcion"]]).strip() if colmap["descripcion"] else ""
+                und  = str(row[colmap["unidad"]]).strip() if colmap["unidad"] else ""
+                cant = row[colmap["cantidad"]] if colmap["cantidad"] else ""
+                vunit = row[colmap["v_unit"]] if colmap["v_unit"] else ""
+                vtotal = row[colmap["v_total"]] if colmap["v_total"] else ""
 
-            # --------- calcular altura REAL de la fila según descripción ----------
-            # Importante: la fuente debe estar seteada antes de medir
-            self.set_default_typography(size=10, bold=False)
+                # Total general (robusto)
+                try:
+                    if hasattr(self, "_parse_number"):
+                        total_general += float(self._parse_number(vtotal))
+                    else:
+                        total_general += float(vtotal)
+                except Exception:
+                    pass
 
-            lines = self._nb_lines(w_desc - 2 * pad, desc, line_h)
-            row_h = (line_h * lines) + (2 * pad)
+                # Calcular altura real de la fila según descripción
+                self.set_default_typography(size=10, bold=False)  # importante antes de medir
+                lines = self._nb_lines(w_desc - 2 * pad, desc, line_h)
+                row_h = (line_h * lines) + (2 * pad)
 
-            x = self.l_margin
-            y = self.get_y()
+                # --- salto de página MANUAL antes de dibujar la fila ---
+                bottom_limit = self.h - self.b_margin
+                if self.get_y() + row_h > bottom_limit:
+                    self.add_page()
+                    _draw_table_header()
 
-            # 1) Ítem (CELL)
-            self.set_xy(x, y)
-            self.cell(w_item, row_h, item, border=1, align="C")
+                x = self.l_margin
+                y = self.get_y()
 
-            # 2) Descripción (RECT + MULTI_CELL con padding)
-            self.set_xy(x + w_item, y)
-            self.rect(x + w_item, y, w_desc, row_h)  # borde exacto
-            self.set_xy(x + w_item + pad, y + pad)
-            self.multi_cell(w_desc - 2 * pad, line_h, desc, border=0, align="L")
+                # 1) Ítem
+                self.set_xy(x, y)
+                self.cell(w_item, row_h, item, border=1, align="C")
 
-            # 3) Unidad (CELL)
-            self.set_xy(x + w_item + w_desc, y)
-            self.cell(w_und, row_h, und, border=1, align="C")
+                # 2) Descripción (rect + multi_cell con padding)
+                self.set_xy(x + w_item, y)
+                self.rect(x + w_item, y, w_desc, row_h)  # borde exacto
+                self.set_xy(x + w_item + pad, y + pad)
+                self.multi_cell(w_desc - 2 * pad, line_h, desc, border=0, align="L")
 
-            # 4) Cantidad (CELL)
-            self.set_xy(x + w_item + w_desc + w_und, y)
-            self.cell(w_cant, row_h, str(cant), border=1, align="C")
+                # 3) Unidad
+                self.set_xy(x + w_item + w_desc, y)
+                self.cell(w_und, row_h, und, border=1, align="C")
 
-            # 5) Valor Unitario (CELL)
-            self.set_xy(x + w_item + w_desc + w_und + w_cant, y)
-            self.cell(w_vu, row_h, f"$  {self._money_cop(vunit)}", border=1, align="R")
+                # 4) Cantidad
+                self.set_xy(x + w_item + w_desc + w_und, y)
+                self.cell(w_cant, row_h, str(cant), border=1, align="C")
 
-            # 6) Valor Total (CELL)
-            self.set_xy(x + w_item + w_desc + w_und + w_cant + w_vu, y)
-            self.cell(w_vt, row_h, f"$  {self._money_cop(vtotal)}", border=1, align="R")
+                # 5) Valor Unitario
+                self.set_xy(x + w_item + w_desc + w_und + w_cant, y)
+                self.cell(w_vu, row_h, f"$  {self._money_cop(vunit)}", border=1, align="R")
 
-            # bajar al final de la fila
-            self.set_y(y + row_h)
+                # 6) Valor Total
+                self.set_xy(x + w_item + w_desc + w_und + w_cant + w_vu, y)
+                self.cell(w_vt, row_h, f"$  {self._money_cop(vtotal)}", border=1, align="R")
 
-            # salto de página preventivo
-            if self.get_y() > (self.h - self.b_margin - 15):
+                # Bajar al final de la fila
+                self.set_y(y + row_h)
+
+            # --- Antes de imprimir TOTAL, verificar espacio ---
+            total_h = 8
+            bottom_limit = self.h - self.b_margin
+            if self.get_y() + total_h > bottom_limit:
                 self.add_page()
+                _draw_table_header()
 
-        # Fila Total (verde)
-        self.set_fill_color(146, 208, 80)
-        self.set_default_typography(size=10, bold=True)
+            # Fila Total (verde) — CORREGIDA (no se desborda)
+            self.set_fill_color(146, 208, 80)
+            self.set_default_typography(size=10, bold=True)
 
-        self.cell(w_item + w_desc + w_und + w_cant, 8, "", border=1, fill=False)
-        self.cell(w_vu, 8, "Total", border=1, align="C", fill=True)
-        self.cell(w_vt, 8, f"$  {self._money_cop(total_general)}", border=1, align="R", fill=True)
-        self.ln(8)
+            # Vacío hasta Cantidad
+            self.cell(w_item + w_desc + w_und + w_cant, 8, "", border=1, fill=False)
+
+            # "Total" en la columna Valor Unitario
+            self.cell(w_vu, 8, "Total", border=1, align="C", fill=True)
+
+            # Valor del total en la columna Valor Total (solo w_vt)
+            self.set_default_typography(size=9, bold=True)  # baja un poco la fuente para números grandes
+            self.cell(w_vt, 8, f"$  {self._money_cop(total_general)}", border=1, align="R", fill=True)
+
+            # Volver a fuente normal
+            self.set_default_typography(size=10, bold=False)
+            self.ln(8)
+
+        finally:
+            # Restaurar auto page break
+            self.set_auto_page_break(auto=old_apb, margin=old_bm)
 
         # Reset colores
         self.set_text_color(0, 0, 0)
-
-        self._write_precosteo_status_and_signature(estado="EN APROBACIÓN")
 
 
     def _write_precosteo_status_and_signature(self, estado: str = "EN APROBACIÓN") -> None:
