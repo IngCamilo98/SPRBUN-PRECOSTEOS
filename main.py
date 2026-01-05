@@ -11,7 +11,7 @@ def main():
 
     # Rango fechas
     fecha_inicio = "11/26/2025"
-    fecha_fin = "12/18/2025"
+    fecha_fin = "12/10/2025"
 
     resumen = (
         "Las actividades ejecutadas se orientaron al mantenimiento integral de cubiertas "
@@ -48,8 +48,6 @@ def main():
         .drop_duplicates()
         .reset_index(drop=True)
         )
-
-
 
     pdf = CreatePrecostoPDF()
     pdf.render_precosteo(

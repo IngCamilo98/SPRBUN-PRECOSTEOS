@@ -6,6 +6,8 @@ from datetime import datetime, date
 from typing import Optional, Tuple
 
 from fpdf import FPDF
+import pandas as pd
+
 
 
 @dataclass(frozen=True)
@@ -229,7 +231,7 @@ class CreatePrecostoPDF(FPDF):
             return None
 
         # intentos típicos
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
             try:
                 return datetime.strptime(s, fmt).date()
             except Exception:
@@ -298,8 +300,8 @@ class CreatePrecostoPDF(FPDF):
     def filter_bd_by_range(self, bd_df, fecha_inicio, fecha_fin):
         """
         Filtra el dataframe BD por fechas:
-        - Si existe columna FECHA: inicio <= FECHA <= fin
-        - Si existe INICIO/FIN en BD: intersección de rangos con [inicio, fin]
+        - Si existe columna FECHA: inicio <= FECHA <= fin  (comparación por SOLO fecha, sin hora)
+        - Si existe INICIO/FIN en BD: intersección de rangos con [inicio, fin] (solo fecha)
         - Si no hay columnas fecha detectables: retorna BD completo
         """
         if bd_df is None:
@@ -310,28 +312,40 @@ class CreatePrecostoPDF(FPDF):
         if ini is None or fin is None:
             return bd_df
 
+        # ✅ Asegurar que ini/fin sean date (sin hora)
+        if hasattr(ini, "date"):
+            ini = ini.date()
+        if hasattr(fin, "date"):
+            fin = fin.date()
+
         col_fecha, col_ini, col_fin = self._detect_date_columns(bd_df)
 
-        # Copia liviana
         df = bd_df.copy()
 
         if col_fecha:
-            df["_FECHA_"] = df[col_fecha].apply(self._to_date)
+            # ✅ Convertir FECHA a date (sin hora) de forma robusta
+            fechas = pd.to_datetime(df[col_fecha], errors="coerce")
+            df["_FECHA_"] = fechas.dt.date
             df = df[df["_FECHA_"].notna()]
             df = df[(df["_FECHA_"] >= ini) & (df["_FECHA_"] <= fin)]
             df = df.drop(columns=["_FECHA_"], errors="ignore")
             return df
 
         if col_ini and col_fin:
-            df["_INI_"] = df[col_ini].apply(self._to_date)
-            df["_FIN_"] = df[col_fin].apply(self._to_date)
+            # ✅ Convertir INI/FIN a date (sin hora) de forma robusta
+            ini_dt = pd.to_datetime(df[col_ini], errors="coerce")
+            fin_dt = pd.to_datetime(df[col_fin], errors="coerce")
+            df["_INI_"] = ini_dt.dt.date
+            df["_FIN_"] = fin_dt.dt.date
             df = df[df["_INI_"].notna() & df["_FIN_"].notna()]
-            # intersección: (ini <= FIN_BD) y (fin >= INI_BD)
+
+            # Intersección: (ini <= FIN_BD) y (fin >= INI_BD)
             df = df[(ini <= df["_FIN_"]) & (fin >= df["_INI_"])]
             df = df.drop(columns=["_INI_", "_FIN_"], errors="ignore")
             return df
 
         return df
+
 
     # ─────────────── Tabla ───────────────
     @staticmethod
