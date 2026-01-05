@@ -631,6 +631,9 @@ class CreatePrecostoPDF(FPDF):
             # si viene largo, usa la primera parte como título
             lugar_titulo = lugares_txt.split(",")[0].strip()[:60]
         self._write_section_table(lugar_titulo=lugar_titulo or "LUGAR DE EJECUCIÓN", codigo_precosteo=codigo_precosteo, bd_filtrado=bd_filtrado)
+        # 👉 ESTADO + FIRMA (ESTO FALTABA)
+        self._write_precosteo_status_and_signature("EN APROBACIÓN")
+
 
     # ─────────────── Guardado ───────────────
     def default_output_path(self, cod_prec: str | None = None) -> Path:
